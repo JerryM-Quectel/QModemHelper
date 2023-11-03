@@ -17,8 +17,6 @@
 #ifndef __SAHARA_CORE_H__
 #define __SAHARA_CORE_H__
 #define _GNU_SOURCE
-#include <linux/usbdevice_fs.h>
-#include <linux/usb/ch9.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -27,7 +25,6 @@
 #include <dirent.h>
 #include <err.h>
 #include <getopt.h>
-#include <libudev.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -40,8 +37,7 @@
 #include <fcntl.h>
 #include <syslog.h>
 
-#define SWITCHED_TO_EDL 1
-#define SWITCHED_TO_SBL 0
+
 
 #define QUEC_SAHARA_FW_UPDATE_PROCESS_REPORT_ID 0x20
 #define QUEC_SAHARA_FW_UPDATE_END_ID  0x21
@@ -50,8 +46,7 @@
 #define SAHARA_RAW_BUFFER_SIZE (8 * 1024)
 #define SINGLE_IMAGE_HDR_SIZE (4 * 1024)
 
-#define MAX_NUM_ENDPOINTS 0xff
-#define MAX_NUM_INTERFACES 0xff
+
 
 #define dbg(fmt, arg...)                                  \
     do                                                    \
@@ -105,14 +100,7 @@ typedef enum
   QUEC_FW_UPGRADE_ERR_FLASH_FAILED,
 } quec_x_fw_upgrade_err_code;
 
-struct qdl_device
-{
-    int fd;
-    int in_ep;
-    int out_ep;
-    size_t in_maxpktsize;
-    size_t out_maxpktsize;
-};
+
 
 struct sahara_pkt
 {
@@ -183,13 +171,7 @@ struct sahara_pkt
 };
 
 
-int qdl_write(struct qdl_device *qdl, const void *buf, size_t len);
-int qdl_read(struct qdl_device *qdl, void *buf, size_t len, unsigned int timeout);
-int qdl_open(struct qdl_device *qdl);
-int qdl_close(struct qdl_device *qdl);
-
-int sahara_reboot_modem();
-int sahara_flash_carrier(char *file_name);
+int firehose_sahara(void *usb_handle, const char *firehose_mbn);
 int sahara_flash_all(char * main_file_path,char*  oem_file_path,char* carrier_file_path);
 int flash_mode_check(void);
 

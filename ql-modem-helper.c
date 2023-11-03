@@ -19,9 +19,6 @@
 #include "ql-gpio.h"
 #include <errno.h>
 #include <stdint.h>
-#include <linux/usbdevice_fs.h>
-#include <linux/usb/ch9.h>
-#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <assert.h>
 #include <ctype.h>
@@ -54,6 +51,7 @@ const char kFlashModeCheck[] = "flash_mode_check";
 const char kReboot[] = "reboot";
 const char kClearAttachAPN[] = "clear_attach_apn";
 const char kFwVersion[] = "fw_version";
+const char kFirehoseFlash[] = "firehose_flash";
 
 // Keys used for the kFlashFirmware/kFwVersion/kGetFirmwareInfo switches
 const char kFwMain[] = "main";
@@ -63,6 +61,8 @@ const char kFwAp[] = "ap";
 const char kFwDev[] = "dev";
 const char kFwCarrierUuid[] = "carrier_uuid";
 const char kUnknownRevision[] = "unknown-revision";
+
+extern int firehose_flash(char *firehose_dir);
 
 static int print_help(int);
 static int parse_flash_fw_parameters(char *arg, char *main_fw, char *oem_fw, char *carrier_fw);
@@ -230,13 +230,16 @@ int main(int argc, char *argv[])
         {kFlashModeCheck, 0, NULL, 'M'},
 		{kResetGpioLine, 2, NULL, 'N'},
         {kReboot, 0, NULL, 'R'},
+        {kFirehoseFlash, 1, NULL, 'E'},
         {"help", 0, NULL, 'H'},
         {},
     };
-	uint reset_line = 0;
     int opt;
-    int ret;
+    int ret = -1;
 	int reset_flag = 0;
+	uint reset_line = 0;
+	char *firehose_flash_param = NULL;
+	char *flash_fw_param = NULL;
 
     openlog ("qmodemhelper", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
 
@@ -257,15 +260,10 @@ int main(int argc, char *argv[])
                 syslog(0, "Swithing the modem into firmware download mode %d\n", ret);
 				return 0;
             case 'A':
-				if (power_lock(kPowerOverrideLockDirectoryPath, kPowerOverrideLockFileName) !=0) {
-					printf("Cannot aquire file lock\n");
-					return EXIT_FAILURE;
-				}
-				ret = flash_firmware(optarg);
-				power_unlock(kPowerOverrideLockDirectoryPath, kPowerOverrideLockFileName);
-				return ret;
+				flash_fw_param = strdup(optarg);
+				break;
             case 'R':
-							  reset_flag = 1;
+				reset_flag = 1;
                 break;
             case 'M':
 				if (flash_mode_check()) {
@@ -278,6 +276,9 @@ int main(int argc, char *argv[])
 				reset_line = atoi(optarg);
 				printf("Baseline offset %d\n", reset_line);
 				break;
+			case 'E':
+				firehose_flash_param  = strdup(optarg);
+				break;
             case 'H':
                 print_help(argc);
                 return 0;
@@ -285,15 +286,50 @@ int main(int argc, char *argv[])
                 print_help(argc);
                 return 0;
             default:
-                break;
+				printf("invalid option\n");
+                return 0;
+
             }
         }
 
-		if ((reset_flag) && (reset_line)) {
-			if (power_lock(kPowerOverrideLockDirectoryPath, kPowerOverrideLockFileName) !=0) {
-				printf("Cannot aquire file lock\n");
-				return EXIT_FAILURE;
+		if (power_lock(kPowerOverrideLockDirectoryPath, kPowerOverrideLockFileName) !=0) {
+			printf("Cannot aquire file lock\n");
+			return EXIT_FAILURE;
+		}
+
+		if (flash_fw_param != NULL && 
+			firehose_flash_param == NULL)
+		{
+			ret = flash_firmware(flash_fw_param);
+		}
+		else if (flash_fw_param == NULL && 
+				firehose_flash_param != NULL)
+		{
+			ret = firehose_flash(firehose_flash_param);
+			
+		}
+		else if (flash_fw_param != NULL && 
+				firehose_flash_param != NULL)
+		{
+			if (firehose_flash(firehose_flash_param) == 0)
+			{
+				for (;;)
+				{
+					if (!flash_mode_check())
+					{
+						printf("wait ...\n");
+						sleep(1);
+					}
+					else 
+						break;
+				
+				}
+
+				ret = flash_firmware(flash_fw_param);
 			}
+		}
+		else if ((reset_flag) && (reset_line)) 
+		{
 			printf("Reseting line: %d\n", reset_line );
 			ret = gpio_reboot_modem(reset_line);
 			if (ret) {
@@ -302,9 +338,10 @@ int main(int argc, char *argv[])
 			else {
 				printf("Modem is rebooting\n");
 			}
-			power_unlock(kPowerOverrideLockDirectoryPath, kPowerOverrideLockFileName);
-			return ret;
-			}
-        closelog();
-        return EXIT_FAILURE;
+		}
+
+		power_unlock(kPowerOverrideLockDirectoryPath, kPowerOverrideLockFileName);
+
+	closelog();
+	return ret;
 }

@@ -45,88 +45,7 @@ static int log_printf(int lvl, const char *log_msg)
         log_printf(0, log_buff);                          \
     } while (0)
 
-static int file_get_value(const char *fpath, int base);
-int flash_mode_check(void);
 
-int flash_mode_check(void)
-{
-    struct dirent *ent = NULL;
-    DIR *pDir;
-    const char *rootdir = "/sys/bus/usb/devices";
-    int find = 0;
-    int idVendor;
-    int numInterfaces;
-
-    pDir = opendir(rootdir);
-    if (!pDir)
-    {
-        info_printf("not open [/sys/bus/usb/devices] dir");
-        return 0;
-    }
-
-    while ((ent = readdir(pDir)) != NULL)
-    {
-        int mbim_intf = 0; /* mbim fixed 0 interface*/
-        char path[512] = {'\0'};
-
-        snprintf(path, sizeof(path), "%s/%s/idVendor", rootdir, ent->d_name);
-        idVendor = file_get_value(path, 16);
-        if (idVendor != 0x2c7c)
-            continue;
-
-        snprintf(path, sizeof(path), "%s/%s/bNumInterfaces", rootdir, ent->d_name);
-        numInterfaces = file_get_value(path, 10);
-
-        if (numInterfaces == 4)
-        {
-            int bInterfaceClass;
-            int bInterfaceProtocol;
-            int bInterfaceSubClass;
-            int bNumEndpoints;
-
-            snprintf(path, sizeof(path), "%s/%s:1.%d/bInterfaceClass", rootdir, ent->d_name, mbim_intf);
-            bInterfaceClass = file_get_value(path, 16);
-
-            snprintf(path, sizeof(path), "%s/%s:1.%d/bInterfaceProtocol", rootdir, ent->d_name, mbim_intf);
-            bInterfaceProtocol = file_get_value(path, 16);
-
-            snprintf(path, sizeof(path), "%s/%s:1.%d/bInterfaceSubClass", rootdir, ent->d_name, mbim_intf);
-            bInterfaceSubClass = file_get_value(path, 16);
-
-            snprintf(path, sizeof(path), "%s/%s:1.%d/bNumEndpoints", rootdir, ent->d_name, mbim_intf);
-            bNumEndpoints = file_get_value(path, 16);
-
-            if (bInterfaceClass == 0x02 && bInterfaceProtocol == 0x00 && bInterfaceSubClass == 0x0e) // mbim interface
-            {
-                if (bNumEndpoints == 0)
-                {
-                    find = 1;
-                }
-            }
-        }
-    }
-    closedir(pDir);
-
-    return find;
-}
-
-
-
-static int file_get_value(const char *fpath, int base)
-{
-    int value = -1;
-    FILE *fp = fopen(fpath, "r");
-
-    if (fp)
-    {
-        if (fscanf(fp, base == 16 ? "%x" : "%d", &value))
-        {
-        };
-        fclose(fp);
-    }
-
-    return value;
-}
 
 void mbim_quec_firmware_update_modem_reboot_set_ready(MbimDevice *dev,
                                                   GAsyncResult *res,
@@ -546,6 +465,21 @@ void mbim_device_new_ready(GObject *obj,
                           user_data);
 }
 
+static int file_get_value(const char *fpath, int base)
+{
+    int value = -1;
+    FILE *fp = fopen(fpath, "r");
+
+    if (fp)
+    {
+        if (fscanf(fp, base == 16 ? "%x" : "%d", &value))
+        {
+        };
+        fclose(fp);
+    }
+
+    return value;
+}
 
 
 static int find_quectel_mbim_device(struct FwUpdaterData *ctx)

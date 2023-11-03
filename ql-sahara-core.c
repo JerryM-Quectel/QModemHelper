@@ -15,6 +15,7 @@
 */
 
 #include "ql-sahara-core.h"
+#include "ql-usb.h"
 
 
 #define dbg_time printf
@@ -25,7 +26,6 @@ static uint32_t le_uint32(uint32_t v32);
 static uint8_t to_hex(uint8_t ch);
 static void print_hex_dump(const char *prefix, const void *buf, size_t len);
 static FILE *create_reset_single_image(void);
-static int check_quec_usb_desc(int fd, struct qdl_device *qdl, int *intf);
 
 const char *boot_sahara_cmd_id_str[QUEC_SAHARA_FW_UPDATE_END_ID+1] = {
         "SAHARA_NO_CMD_ID",               // = 0x00,
@@ -170,327 +170,20 @@ EXIT:
 }
 
 
-int qdl_read(struct qdl_device *qdl, void *buf, size_t len, unsigned int timeout)
-{
-    struct usbdevfs_bulktransfer bulk = {};
-    bulk.ep = qdl->in_ep;
-    bulk.len = len;
-    bulk.data = buf;
-    bulk.timeout = timeout;
-    return ioctl(qdl->fd, USBDEVFS_BULK, &bulk);
-}
-
-int qdl_write(struct qdl_device *qdl, const void *buf, size_t len)
-{
-    unsigned char *data = (unsigned char*) buf;
-    struct usbdevfs_bulktransfer bulk = {};
-    unsigned count = 0;
-    size_t len_orig = len;
-    int n;
-    while(len > 0)
-    {
-        int xfer;
-        xfer = (len > qdl->out_maxpktsize) ? qdl->out_maxpktsize : len;
-
-        bulk.ep = qdl->out_ep;
-        bulk.len = xfer;
-        bulk.data = data;
-        bulk.timeout = 1000;
-
-        n = ioctl(qdl->fd, USBDEVFS_BULK, &bulk);
-        if(n != xfer)
-        {
-            fprintf(stderr, "ERROR: n = %d, errno = %d (%s)\n", n, errno, strerror(errno));
-            return -1;
-        }
-        count += xfer;
-        len -= xfer;
-        data += xfer;
-    }    
-    if (len_orig % qdl->out_maxpktsize == 0)
-    {
-        bulk.ep = qdl->out_ep;
-        bulk.len = 0;
-        bulk.data = NULL;
-        bulk.timeout = 1000;
-
-        n = ioctl(qdl->fd, USBDEVFS_BULK, &bulk);
-        if (n < 0)
-            return n;
-    }
-    return count;
-}
-
-int qdl_close(struct qdl_device *qdl)
-{
-    int bInterfaceNumber = 3;
-    ioctl(qdl->fd, USBDEVFS_RELEASEINTERFACE, &bInterfaceNumber);
-    close(qdl->fd);
-    return 0;
-}
-
-int qdl_open(struct qdl_device *qdl)
-{
-    struct udev_enumerate *enumerate;
-    struct udev_list_entry *devices;
-    struct udev_list_entry *dev_list_entry;
-    struct udev_monitor *mon;
-    struct udev_device *dev;
-    const char *dev_node;
-    struct udev *udev;
-    const char *path;
-    struct usbdevfs_ioctl cmd;
-    int intf = -1;
-    int ret;
-    int fd;
-
-    udev = udev_new();
-    if (!udev)
-        err(1, "failed to initialize udev");
-
-    mon = udev_monitor_new_from_netlink(udev, "udev");
-    udev_monitor_filter_add_match_subsystem_devtype(mon, "usb", NULL);
-    udev_monitor_enable_receiving(mon);
-
-    enumerate = udev_enumerate_new(udev);
-    udev_enumerate_add_match_subsystem(enumerate, "usb");
-    udev_enumerate_scan_devices(enumerate);
-    devices = udev_enumerate_get_list_entry(enumerate);
-
-    udev_list_entry_foreach(dev_list_entry, devices)
-    {
-        path = udev_list_entry_get_name(dev_list_entry);
-        dev = udev_device_new_from_syspath(udev, path);
-        dev_node = udev_device_get_devnode(dev);
-
-        if (!dev_node)
-        {
-            continue;
-        }
-        fd = open(dev_node, O_RDWR);
-        if (fd < 0)
-            continue;
-        dbg_time("D: %s \n", dev_node);
-        ret = check_quec_usb_desc(fd, qdl, &intf);
-        if (!ret)
-        {
-            goto found;
-        }
-        close(fd);
-    }
-
-    udev_enumerate_unref(enumerate);
-    udev_monitor_unref(mon);
-    udev_unref(udev);
-    return -ENOENT;
-
-found:
-    udev_enumerate_unref(enumerate);
-    udev_monitor_unref(mon);
-    udev_unref(udev);
-
-    cmd.ifno = intf;
-    cmd.ioctl_code = USBDEVFS_DISCONNECT;
-    cmd.data = NULL;
-
-    ret = ioctl(qdl->fd, USBDEVFS_IOCTL, &cmd);
-    if (ret && errno != ENODATA)
-        err(1, "failed to disconnect kernel driver");
-
-    ret = ioctl(qdl->fd, USBDEVFS_CLAIMINTERFACE, &intf);
-    if (ret < 0)
-        err(1, "failed to claim USB interface");
-
-    return 0;
-}
-
 int sahara_rx_data(struct qdl_device *qdl, void *rx_buffer, size_t bytes_to_read)
 {
-    struct sahara_pkt * cmd_packet_header = NULL;
+    struct sahara_pkt * rx_pkt = NULL;
     size_t bytes_read = 0;
     if (!bytes_to_read)
     {
         bytes_read = qdl_read(qdl, rx_buffer, sizeof(struct sahara_pkt), 5000);
-        cmd_packet_header = (struct sahara_pkt *)rx_buffer;
-        dbg("RECEIVED <-- %s %zx bytes", boot_sahara_cmd_id_str[le_uint32(cmd_packet_header->cmd)], bytes_read);
+        rx_pkt = (struct sahara_pkt *)rx_buffer;
+        dbg("RECEIVED <-- %s %ld bytes\n", boot_sahara_cmd_id_str[le_uint32(rx_pkt->cmd)], bytes_read);
         return bytes_read;
     }
 
     return 0;
 }
-
-int check_quec_usb_desc(int fd, struct qdl_device *qdl, int *intf)
-{
-    const struct usb_interface_descriptor *ifc;
-    const struct usb_endpoint_descriptor *ept;
-    const struct usb_device_descriptor *dev;
-    const struct usb_config_descriptor *cfg;
-    const struct usb_descriptor_header *hdr;
-    unsigned type;
-    unsigned out;
-    unsigned in;
-    unsigned k;
-    unsigned l;
-    ssize_t n;
-    size_t out_size;
-    size_t in_size;
-    void *ptr;
-    void *end;
-    char desc[1024];
-
-    n = read(fd, desc, sizeof(desc));
-    if (n < 0)
-    {
-        return n;
-    }
-    ptr = (void*)desc;
-    end = ptr + n;
-    dev = ptr;
-
-    /* Consider only devices with vid 0x2c7c */
-    if ((dev->idVendor != 0x2c7c) && (dev->idVendor != 0x05c6)) 
-    {
-        return -EINVAL;
-    }
-    else
-    {
-        if (dev->idProduct == 9008)
-        {
-            return SWITCHED_TO_EDL;
-        }
-    }
-
-    dbg_time("D: idVendor=%04x idProduct=%04x\n",  dev->idVendor, dev->idProduct);
-    ptr += dev->bLength;
-
-    if (ptr >= end || dev->bDescriptorType != USB_DT_DEVICE)
-        return -EINVAL;
-
-    cfg = ptr;
-    ptr += cfg->bLength;
-    if (ptr >= end || cfg->bDescriptorType != USB_DT_CONFIG)
-        return -EINVAL;
-
-    unsigned numInterfaces = cfg->bNumInterfaces;
-    dbg_time("C: bNumInterfaces: %d\n", numInterfaces);
-
-    if (numInterfaces <= 0 || numInterfaces > MAX_NUM_INTERFACES)
-    {
-        syslog(0, "invalid no of interfaces: %d\n", numInterfaces);
-        return -EINVAL;
-    }
-    for (k = 0; k < numInterfaces; k++)
-    {
-        if (ptr >= end)
-        {
-            return -EINVAL;
-        }
-
-        do
-        {
-            ifc = ptr;
-            if (ifc->bLength < USB_DT_INTERFACE_SIZE)
-            {
-                syslog(0, "Exiting here ifc->bLengh:%d Interface size: %d\n", ifc->bLength, USB_DT_INTERFACE_SIZE);
-            }
-            ptr += ifc->bLength;
-
-        } while (ptr < end && ifc->bDescriptorType != USB_DT_INTERFACE);
-
-        dbg_time("I: If#= %d Alt= %d #EPs= %d Cls=%02x Sub=%02x Prot=%02x\n",
-                ifc->bInterfaceNumber, ifc->bAlternateSetting,
-                ifc->bNumEndpoints, ifc->bInterfaceClass,
-                ifc->bInterfaceSubClass, ifc->bInterfaceProtocol);
-        in = -1;
-        out = -1;
-        in_size = 0;
-        out_size = 0;
-
-        unsigned noOfEndpoints = ifc->bNumEndpoints;
-        if (noOfEndpoints <= 0 || noOfEndpoints > MAX_NUM_ENDPOINTS)
-        {
-            syslog(0, "invalid no of endpoints: %d\n", noOfEndpoints);
-            continue;
-        }
-        for (l = 0; l < noOfEndpoints; l++)
-        {
-            if (ptr >= end)
-            {
-                syslog(0, "%s %d end has been reached\n",__FILE__, __LINE__);
-                return -EINVAL;
-            }
-
-            do
-            {
-                ept = ptr;
-                if (ept->bLength < USB_DT_ENDPOINT_SIZE)
-                {
-                    syslog(0, "%s %d endpoint length:%d expected size: %d \n",__FILE__, __LINE__, ept->bLength,  USB_DT_ENDPOINT_SIZE);
-                    return -EINVAL;
-                }
-                ptr += ept->bLength;
-            } while (ptr < end && ept->bDescriptorType != USB_DT_ENDPOINT);
-
-            dbg_time("E: Ad=%02x Atr=%02x MxPS= %d Ivl=%dms\n",
-                ept->bEndpointAddress,
-                ept->bmAttributes,
-                ept->wMaxPacketSize,
-                ept->bInterval);
-
-            type = ept->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK;
-            if (type != USB_ENDPOINT_XFER_BULK)
-                continue;
-
-            if (ept->bEndpointAddress & USB_DIR_IN)
-            {
-                in = ept->bEndpointAddress;
-                in_size = ept->wMaxPacketSize;
-            }
-            else
-            {
-                out = ept->bEndpointAddress;
-                out_size = ept->wMaxPacketSize;
-            }
-
-            if (ptr >= end)
-                break;
-
-            hdr = ptr;
-            if (hdr->bDescriptorType == USB_DT_SS_ENDPOINT_COMP)
-                ptr += USB_DT_SS_EP_COMP_SIZE;
-        }
-
-        if (ifc->bInterfaceClass != 0xff)
-            continue;
-
-        if (ifc->bInterfaceSubClass != 0xff)
-            continue;
-
-        if (ifc->bInterfaceProtocol != 0xff &&
-            ifc->bInterfaceProtocol != 16 &&
-            ifc->bInterfaceProtocol != 17)
-            continue;
-
-        qdl->fd = fd;
-        qdl->in_ep = in;
-        qdl->out_ep = out;
-        qdl->in_maxpktsize = in_size;
-        qdl->out_maxpktsize = out_size;
-
-        if( qdl->in_maxpktsize <= 0 || qdl->out_maxpktsize <= 0 )
-        {
-            syslog(0, "%s %d invalid max packet size received.\n",__FILE__, __LINE__);
-            return -ENOENT;
-        }
-        
-        *intf = ifc->bInterfaceNumber;
-
-        return SWITCHED_TO_SBL;
-    }
-
-    return -ENOENT;
-}
-
 
 static void sahara_hello_multi(struct qdl_device *qdl, struct sahara_pkt *pkt)
 {
@@ -508,133 +201,54 @@ static void sahara_hello_multi(struct qdl_device *qdl, struct sahara_pkt *pkt)
     return;
 }
 
-int start_image_transfer(struct qdl_device *qdl ,
-            struct sahara_pkt* sahara_read_data,
-            char *file_name)
+
+static int start_image_transfer(void *usb_handle, void *tx_buffer, struct sahara_pkt *rx_pkt, FILE *file_handle)
 {
     int retval = 0;
-    void* tx_buffer;
-    FILE* file_handle;
-    uint32_t file_offset = 0;
-    size_t file_read;
-    struct single_image_hdr *img_hdr = NULL;
+
     uint32_t bytes_read = 0, bytes_to_read_next;
-    uint32_t DataOffset = 0;
-    uint32_t DataLength = 0;
+    uint32_t DataOffset = le_uint32(rx_pkt->read_req.offset);
+    uint32_t DataLength = le_uint32(rx_pkt->read_req.length);
 
-    if (qdl == NULL )
-    {
-        return -2;
-    }
+    printf("0x%08x 0x%08x 0x%08x\n", le_uint32(rx_pkt->read_req.image), DataOffset, DataLength);
 
-    if (sahara_read_data == NULL)
-    {
-        return -3;
-    }
-
-    DataOffset = le_uint32(sahara_read_data->read_req.offset);
-    DataLength = le_uint32(sahara_read_data->read_req.length);
-
-    img_hdr = (struct single_image_hdr *)malloc(SINGLE_IMAGE_HDR_SIZE);
-    if (!img_hdr)
-    {
-        return -4;
-    }
-
-    tx_buffer = malloc(SAHARA_RAW_BUFFER_SIZE);
-    if (!tx_buffer)
-    {
-        free(img_hdr);
-        return -4;
-    }
-
-    if ( file_name != NULL )
-    {
-        file_handle = fopen(file_name, "rb");
-    }
-    else
-    {
-        file_handle = create_reset_single_image();
-    }
-
-
-    if (!file_handle)
-    {
-        free(img_hdr);
-        free(tx_buffer);
-        return -5;
-    }
-
-
-    file_read = fread(img_hdr, 1, (SINGLE_IMAGE_HDR_SIZE), file_handle);
-    if (file_read != (SINGLE_IMAGE_HDR_SIZE))
-    {
-        free(img_hdr);
-        free(tx_buffer);
-        fclose(file_handle);
-        return -6;
-    }
-
-    /* Reset the file pointer to get it ready for delivery*/
-    fseek(file_handle, 0, SEEK_SET);
-
-    dbg("%s:Img id: 0x%08x Offset: 0x%08x Len: 0x%08x", __FUNCTION__ ,le_uint32(sahara_read_data->read_req.image), DataOffset, DataLength);
-
-    if (fseek(file_handle, file_offset + (long)DataOffset, SEEK_SET))
-    {
-        dbg("%d errno: %d (%s)", __LINE__, errno, strerror(errno));
-        free(img_hdr);
-        free(tx_buffer);
-        fclose(file_handle);
+    if (fseek(file_handle, (long)DataOffset, SEEK_SET)) {
+        printf("%d errno: %d (%s)", __LINE__, errno, strerror(errno));
         return 0;
     }
 
-    while (bytes_read < DataLength)
-    {
+    while (bytes_read < DataLength) {
         bytes_to_read_next = MIN((uint32_t)DataLength - bytes_read, SAHARA_RAW_BUFFER_SIZE);
         retval = fread(tx_buffer, 1, bytes_to_read_next, file_handle);
-
-        if (retval < 0)
-        {
-            dbg("file read failed: %s", strerror(errno));
-            free(img_hdr);
-            free(tx_buffer);
-            fclose(file_handle);
+    
+        if (retval < 0) {
+            printf("file read failed: %s\n", strerror(errno));
             return 0;
         }
-
-        if ((uint32_t)retval != bytes_to_read_next)
-        {
-            dbg("Read %d bytes, but was asked for 0x%08x bytes", retval, DataLength);
-            free(img_hdr);
-            free(tx_buffer);
-            fclose(file_handle);
+    
+        if ((uint32_t) retval != bytes_to_read_next) {
+            printf("Read %d bytes, but was asked for 0x%08x bytes\n", retval, DataLength);
             return 0;
-        }
+	}
 
-        /*send the image data*/
-        if (0 == qdl_write(qdl, tx_buffer, bytes_to_read_next))
-        {
-            dbg("Tx Sahara Image Failed");
-            free(img_hdr);
-            free(tx_buffer);
-            fclose(file_handle);
+	/*send the image data*/
+	if (0 == qdl_write (usb_handle, tx_buffer, bytes_to_read_next)) {
+            printf("Tx Sahara Image Failed\n");
             return 0;
-        }
-
-        bytes_read += bytes_to_read_next;
+	}
+    
+	bytes_read += bytes_to_read_next;
     }
-    free(tx_buffer);
-    free(img_hdr);
-    fclose(file_handle);
+
     return 1;
 }
-
 
 int sahara_flash_all(char *main_file_path, char *oem_file_path, char *carrier_file_path)
 {
     int ret;
     int i, count;
+    void *tx_buffer;
+    FILE *file_handle;
 
     struct qdl_device qdl;
     struct sahara_pkt *pspkt;
@@ -681,18 +295,33 @@ int sahara_flash_all(char *main_file_path, char *oem_file_path, char *carrier_fi
         qdl_close(&qdl);
         return -1;
     }
-
     sahara_hello_multi(&qdl, pspkt);
+
+    tx_buffer = malloc(SAHARA_RAW_BUFFER_SIZE);
+    if (!tx_buffer)
+    {
+        qdl_close(&qdl);
+        return -1;
+    }
 
     for(i = 0; i < count; i++)
     {
         current_file_name = files[i];
         if (current_file_name) {
             syslog(0, "\nFlashing : %s\n", current_file_name);
+            file_handle = fopen(current_file_name, "rb");
         } else {
             syslog(0, "\nFlashing reset image\n");
+            file_handle = create_reset_single_image();
         }
-	done = false;
+
+        if (!file_handle)
+        {
+            qdl_close(&qdl);
+            free(tx_buffer);
+        }
+
+        done = false;
         while(!done) {
             memset(buffer, 0 , QBUFFER_SIZE );
             nBytes = sahara_rx_data(&qdl, buffer, 0);
@@ -704,12 +333,16 @@ int sahara_flash_all(char *main_file_path, char *oem_file_path, char *carrier_fi
             if ((uint32_t)nBytes != pspkt->length)
             {
                 fprintf(stderr, "Sahara pkt length not matching");
+
+                fclose(file_handle);
+                free(tx_buffer);
+                qdl_close(&qdl);
                 return -EINVAL;
             }
 
             if (pspkt->cmd == 3)
             {
-                start_image_transfer(&qdl , pspkt , current_file_name);
+                start_image_transfer(&qdl, tx_buffer, pspkt, file_handle);
                 continue;
             }
             if  (pspkt->cmd == QUEC_SAHARA_FW_UPDATE_PROCESS_REPORT_ID)
@@ -729,7 +362,144 @@ int sahara_flash_all(char *main_file_path, char *oem_file_path, char *carrier_fi
                 done = true;
             }
         }
+
+        fclose(file_handle);
     }
+    free(tx_buffer);
     qdl_close(&qdl);
     return 0;
+}
+
+
+static int firehose_sahara_start(void *usb_handle, void *tx_buffer, void *rx_buffer, FILE *file_handle) {
+    struct sahara_pkt *rx_pkt = (struct sahara_pkt *)rx_buffer;
+    struct sahara_pkt *tx_pkt = (struct sahara_pkt *)tx_buffer;   
+
+    printf("STATE <-- SAHARA_WAIT_HELLO\n");
+    if (0 == sahara_rx_data(usb_handle, rx_buffer, 0)) 
+    {
+        return -1;
+    }
+
+    if (le_uint32(rx_pkt->cmd) != 0x01)  // hello id
+    { 
+        printf("Received a different command: %x while waiting for hello packet", rx_pkt->cmd);
+        return -1;
+    }
+    
+    tx_pkt->cmd = 0x02;
+    tx_pkt->length = 0x30;
+    tx_pkt->hello_resp.version = rx_pkt->hello_req.version;
+    tx_pkt->hello_resp.compatible = rx_pkt->hello_req.compatible;
+    tx_pkt->hello_resp.status = 0;
+    tx_pkt->hello_resp.mode = rx_pkt->hello_req.mode;
+
+    switch (le_uint32(rx_pkt->hello_req.mode)) {
+        case 0x00: 
+            printf("RECEIVED <-- SAHARA_MODE_IMAGE_TX_PENDING\n");
+        break;
+        case 0x01: 
+            printf("RECEIVED <-- SAHARA_MODE_IMAGE_TX_COMPLETE\n");
+        break;
+        case 0x02: 
+            printf("RECEIVED <-- SAHARA_MODE_MEMORY_DEBUG\n");
+        break;
+        case 0x03: 
+            printf("RECEIVED <-- SAHARA_MODE_COMMAND\n");
+        break;
+        default:
+            printf("RECEIVED <-- SAHARA_MODE_0x%x\n", le_uint32(rx_pkt->hello_req.mode));
+        break;
+    }
+
+    if (le_uint32(rx_pkt->hello_req.mode) != 0x00) {
+        printf("ERROR NOT SAHARA_MODE_IMAGE_TX_PENDING\n");
+        tx_pkt->hello_resp.mode = 0x00;
+    }
+
+    /*Send the Hello  Resonse Request*/
+    printf("SENDING --> SAHARA_HELLO_RESPONSE\n");
+    if (0 == qdl_write (usb_handle, tx_buffer, tx_pkt->length))
+    {
+        printf("Tx Sahara Data Failed \n");
+        return -1;
+    }
+
+    while (1) {
+        printf("STATE <-- SAHARA_WAIT_COMMAND\n");
+        if (0 == sahara_rx_data(usb_handle, rx_buffer, 0))
+            return -1;
+
+        if (le_uint32(rx_pkt->cmd) == 0x03) {
+            start_image_transfer(usb_handle, tx_buffer, rx_pkt, file_handle);
+        }
+        else if (le_uint32(rx_pkt->cmd) == 0x04) {
+            printf("image_id = %d, status = %d\n", le_uint32(rx_pkt->eoi.image), le_uint32(rx_pkt->eoi.status));
+            if (le_uint32(rx_pkt->eoi.status) == 0x00) 
+            {
+                tx_pkt->cmd = 0x05;
+                tx_pkt->length = 0x08;
+
+                // Send the image data
+                printf("SENDING --> SAHARA_DONE\n");
+                if (0 == qdl_write (usb_handle, tx_buffer, 8)) 
+                {
+                    printf("Sending DONE packet failed\n");
+                    return -1;
+                }
+
+                break;
+            } 
+            else 
+            {
+                return -1;
+            }
+        }
+        else if (le_uint32(rx_pkt->cmd) == 0x01) {
+             continue;
+        }
+        else {
+            printf("Received an unknown command: %d ", le_uint32(rx_pkt->cmd));
+            // send_reset_command (usb_handle, tx_buffer);
+            return -1;
+        }
+    }
+
+    printf("STATE <-- SAHARA_WAIT_DONE_RESP\n");
+    if (0 == sahara_rx_data(usb_handle, rx_buffer, 0))
+        return -1;
+
+    printf("Successfully uploaded all images\n");
+
+    return 0;
+}
+
+int firehose_sahara(void *usb_handle, const char *firehose_mbn) 
+{
+    int ret = 0;
+    FILE *file_handle;
+    void *tx_buffer;
+    void *rx_buffer;
+
+    file_handle = fopen(firehose_mbn, "rb\n");
+    if (file_handle == NULL) {
+        printf("%s %d %s errno: %d (%s)", __func__, __LINE__, firehose_mbn, errno, strerror(errno));
+        return -1;
+    }
+
+    rx_buffer = malloc (SAHARA_RAW_BUFFER_SIZE);
+    tx_buffer = malloc (SAHARA_RAW_BUFFER_SIZE);
+
+    if (NULL == rx_buffer || NULL == tx_buffer) {
+        printf("Failed to allocate sahara buffers\n");
+        return -1;
+    }
+
+    ret = firehose_sahara_start(usb_handle, tx_buffer, rx_buffer, file_handle);
+    
+    free(rx_buffer);
+    free(tx_buffer);
+    fclose(file_handle);
+
+    return ret;
 }
